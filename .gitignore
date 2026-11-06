@@ -48,3 +48,4 @@ app.*.map.json
 .widget_preview/
 /edge_server/.venv
 edge_server/incident_evidence/
+edge_server/captures
