@@ -10,13 +10,18 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+import platform
+import logging
 
 import cv2
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from ultralytics import YOLO
 from werkzeug.security import check_password_hash, generate_password_hash
 
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
 SERVER_VERSION = "v6-camera-fix"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(BASE_DIR)
 
 # ===== SETTINGS (change here) =====
 MODEL_PATH = "yolov8n-pose.pt"   # use the same model file as your FYP 1
@@ -35,13 +40,12 @@ INVITE_HOURS = 24                # how long an invite code works
 # Which camera to use. Windows renumbers cameras when devices are plugged in or your phone
 # links to the laptop, so choosing by NAME is safer than by number.
 # Run list_cameras.py to see the names.
-CAMERA_NAME = "USB2.0 PC CAMERA"  # part of the camera's name. Use "" to choose by CAMERA_INDEX instead
-CAMERA_INDEX = 0                  # only used when CAMERA_NAME is ""
+CAMERA_NAME = "USB2.0 PC CAMERA"  # Windows only; on macOS/Linux use CAMERA_INDEX
+CAMERA_INDEX = 0                  # camera index on macOS/Linux, or when CAMERA_NAME is ""
 # Folder where Flutter puts the built app (made by: flutter build web --release)
-WEB_DIR = r"C:\Users\HP\Desktop\USIM\SEM 7\Final Year Project II\fyp_security_app\build\web"
+WEB_DIR = os.path.join(PROJECT_DIR, "build", "web")
 # ==================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CAPTURE_DIR = os.path.join(BASE_DIR, "captures")
 EVIDENCE_DIR = os.path.join(BASE_DIR, "incident_evidence")
 DB_PATH = os.path.join(BASE_DIR, "smartcam.db")
@@ -50,7 +54,7 @@ os.makedirs(CAPTURE_DIR, exist_ok=True)
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=WEB_DIR, static_url_path="")
-model = YOLO(MODEL_PATH)
+model = YOLO(os.path.join(BASE_DIR, MODEL_PATH))
 lock = threading.Lock()
 auth_lock = threading.Lock()
 latest_jpeg = None     # small picture with boxes (live view)
@@ -440,6 +444,11 @@ def say(msg):
 def list_cameras():
     """Names of the cameras Windows knows, in the same order OpenCV uses for the index."""
     global _names_cache
+    if platform.system() != "Windows":
+        # OpenCV's native backend can open cameras by index on macOS/Linux, but
+        # DirectShow device-name enumeration is only available on Windows.
+        _names_cache = []
+        return _names_cache
     try:
         import comtypes
 
@@ -451,7 +460,7 @@ def list_cameras():
 
         _names_cache = list(FilterGraph().get_input_devices())
     except Exception as e:
-        say(f"Could not read camera names ({e}). Run: python -m pip install pygrabber")
+        say(f"Could not read Windows camera names ({e}). Install pygrabber and comtypes to select by name.")
     return _names_cache
 
 
@@ -460,7 +469,7 @@ def open_camera():
     It NEVER falls back to another camera, so the laptop's own camera is never shown by mistake.
     Returns (camera, name), or (None, "") when the camera is not available."""
     names = list_cameras()
-    if CAMERA_NAME:
+    if CAMERA_NAME and platform.system() == "Windows":
         if not names:
             say("CAMERA_NAME is set but camera names are unavailable. Run: python -m pip install pygrabber")
             return None, ""
@@ -474,7 +483,10 @@ def open_camera():
         index = CAMERA_INDEX
 
     label = names[index] if names and 0 <= index < len(names) else f"camera {index}"
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if platform.system() == "Windows":
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(index)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -751,6 +763,12 @@ def scheduler_loop():
 # =====================================================================
 @app.route("/")
 def index():
+    if not os.path.isfile(os.path.join(WEB_DIR, "index.html")):
+        return (
+            "Flutter web app is not built yet. From the project root run: "
+            "flutter build web --release",
+            503,
+        )
     return send_from_directory(WEB_DIR, "index.html")
 
 
@@ -1115,7 +1133,7 @@ SIREN_SECONDS = 8                  # how long the siren sounds for each person
 SIREN_VOLUME = 0.35                # 0.0 (silent) to 1.0 (loudest)
 
 try:
-    animal_model = YOLO(ANIMAL_MODEL_PATH)
+    animal_model = YOLO(os.path.join(BASE_DIR, ANIMAL_MODEL_PATH))
 except Exception as e:
     animal_model = None
     print(f"Animal labels are OFF (could not load {ANIMAL_MODEL_PATH}): {e}")
@@ -1178,22 +1196,31 @@ def make_siren_wav_file():
 def siren_loop():
     # The sound can be cancelled at once, so it stops immediately.
     global siren_until
-    try:
-        import winsound
-    except ImportError:
-        return
     path = make_siren_wav_file()
-    playing = False
+    player = None
     while True:
         if not state["siren"]:
             siren_until = 0.0        # switching it off cancels any person already announced
         want = siren_should_play()
-        if want and not playing:
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
-            playing = True
-        elif not want and playing:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-            playing = False
+        if platform.system() == "Windows":
+            import winsound
+            if want and player is None:
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                player = True
+            elif not want and player is not None:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+                player = None
+        else:
+            # macOS ships with afplay. Restart the short tone while the siren is armed.
+            if want and (player is None or player.poll() is not None):
+                player = subprocess.Popen(
+                    ["afplay", path] if platform.system() == "Darwin" else ["aplay", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif not want and player is not None:
+                player.terminate()
+                player = None
         time.sleep(0.05)
 
 
